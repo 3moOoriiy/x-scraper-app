@@ -1,0 +1,137 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* =====================================================
+   THEME VARIABLES (Dark default + Light override)
+   ===================================================== */
+:root,
+html[data-theme="dark"] {
+  --bg-base:        #0a0f1e;
+  --bg-grad-1:      #0a0f1e;
+  --bg-grad-2:      #0f172a;
+  --bg-grad-3:      #131b30;
+  --aurora-1:       rgba(56, 189, 248, 0.10);
+  --aurora-2:       rgba(129, 140, 248, 0.10);
+  --aurora-3:       rgba(244, 114, 182, 0.08);
+  --text-primary:   #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-muted:     #64748b;
+  --surface:        rgba(30, 41, 59, 0.55);
+  --surface-strong: rgba(30, 41, 59, 0.85);
+  --surface-light:  rgba(15, 23, 42, 0.6);
+  --border:         rgba(148, 163, 184, 0.18);
+  --border-strong:  rgba(168, 85, 247, 0.35);
+  --input-bg:       rgba(15, 23, 42, 0.6);
+  --accent:         #38bdf8;
+  --accent-2:       #818cf8;
+  --accent-3:       #ec4899;
+  --accent-4:       #a855f7;
+  --scrollbar-track: rgba(15, 23, 42, 0.3);
+  --selection-bg:   rgba(56, 189, 248, 0.4);
+}
+
+html[data-theme="light"] {
+  /* Cream / Sand palette from twitter-complaints.jsx (Sentara theme) */
+  --bg-base:        #FAF9F4;
+  --bg-grad-1:      #FAF9F4;
+  --bg-grad-2:      #F3F1EA;
+  --bg-grad-3:      #F7F4EB;
+  --aurora-1:       rgba(193, 99, 66, 0.08);   /* orange */
+  --aurora-2:       rgba(58, 126, 191, 0.07);  /* blue */
+  --aurora-3:       rgba(61, 158, 110, 0.06);  /* green */
+  --text-primary:   #1A1916;
+  --text-secondary: #5C5750;
+  --text-muted:     #9C9890;
+  --surface:        rgba(243, 241, 234, 0.85);   /* C.surface */
+  --surface-strong: rgba(255, 255, 255, 0.96);   /* C.card */
+  --surface-light:  rgba(255, 255, 255, 0.9);
+  --border:         rgba(228, 224, 213, 0.95);   /* C.border */
+  --border-strong:  rgba(208, 204, 192, 0.95);   /* C.border2 */
+  --input-bg:       rgba(255, 255, 255, 0.95);
+  --accent:         #C16342;   /* orange - primary */
+  --accent-2:       #D4785A;   /* orangeL */
+  --accent-3:       #3A7EBF;   /* blue */
+  --accent-4:       #3D9E6E;   /* green */
+  --scrollbar-track: rgba(228, 224, 213, 0.6);
+  --selection-bg:   rgba(193, 99, 66, 0.25);
+}
+
+html, body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Tahoma, Arial, sans-serif;
+  min-height: 100vh;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  overflow-x: hidden;
+  transition: background 0.3s ease, color 0.3s ease;
+}
+
+/* =====================================================
+   ANIMATED AURORA BACKGROUND
+   ===================================================== */
+body::before,
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  pointer-events: none;
+}
+
+body::before {
+  background:
+    radial-gradient(ellipse 80% 50% at 20% 30%, var(--aurora-1) 0%, transparent 50%),
+    radial-gradient(ellipse 60% 60% at 80% 70%, var(--aurora-2) 0%, transparent 50%),
+    radial-gradient(ellipse 60% 40% at 60% 20%, var(--aurora-3) 0%, transparent 50%),
+    linear-gradient(135deg, var(--bg-grad-1) 0%, var(--bg-grad-2) 50%, var(--bg-grad-3) 100%);
+  animation: aurora-drift 22s ease-in-out infinite alternate;
+}
+
+body::after {
+  background:
+    radial-gradient(circle at 80% 20%, var(--aurora-1) 0%, transparent 35%),
+    radial-gradient(circle at 20% 80%, var(--aurora-2) 0%, transparent 35%);
+  animation: aurora-drift-2 18s ease-in-out infinite alternate;
+}
+
+@keyframes aurora-drift {
+  0%   { transform: translate(0, 0)     scale(1); }
+  50%  { transform: translate(2%, 1%)   scale(1.05); }
+  100% { transform: translate(-1%, 2%)  scale(1); }
+}
+
+@keyframes aurora-drift-2 {
+  0%   { transform: translate(0, 0); opacity: 0.7; }
+  50%  { transform: translate(-3%, 2%); opacity: 1; }
+  100% { transform: translate(2%, -2%); opacity: 0.7; }
+}
+
+#root {
+  min-height: 100vh;
+  position: relative;
+  z-index: 1;
+}
+
+::-webkit-scrollbar { width: 10px; }
+::-webkit-scrollbar-track { background: var(--scrollbar-track); }
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, var(--accent) 0%, var(--accent-2) 100%);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, var(--accent-4) 0%, var(--accent-3) 100%);
+}
+
+::selection {
+  background: var(--selection-bg);
+  color: #ffffff;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

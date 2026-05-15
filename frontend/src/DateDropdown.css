@@ -1,0 +1,283 @@
+/* =================================================
+   Custom Date Dropdown - clean & modern
+   ================================================= */
+
+.dd {
+  position: relative;
+  width: 100%;
+}
+
+/* Trigger button (closed state) */
+.dd-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  background-color: rgba(15, 23, 42, 0.7);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(168, 85, 247, 0.25);
+  border-radius: 10px;
+  padding: 10px 14px;
+  color: #f1f5f9;
+  font-size: 0.95rem;
+  cursor: pointer;
+  outline: none;
+  transition: all 0.2s;
+  font-family: inherit;
+  text-align: right;
+}
+
+.dd-trigger:hover {
+  border-color: rgba(236, 72, 153, 0.5);
+  background-color: rgba(30, 20, 50, 0.7);
+}
+
+.dd-open .dd-trigger,
+.dd-trigger:focus {
+  border-color: #ec4899;
+  box-shadow:
+    0 0 0 3px rgba(236, 72, 153, 0.2),
+    0 0 20px rgba(168, 85, 247, 0.15);
+}
+
+.dd-trigger-content {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.dd-trigger-main {
+  color: #f1f5f9;
+  font-weight: 600;
+  font-size: 0.95rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.dd-trigger-sub {
+  color: #94a3b8;
+  font-size: 0.78rem;
+}
+
+.dd-arrow {
+  color: #38bdf8;
+  font-size: 0.9rem;
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  flex-shrink: 0;
+}
+
+.dd-arrow-up {
+  transform: rotate(180deg);
+}
+
+/* Pulse animation when dropdown is open */
+.dd-open .dd-arrow {
+  color: #818cf8;
+}
+
+/* Dropdown menu */
+.dd-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  background: rgba(20, 14, 38, 0.98);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  border: 1px solid rgba(168, 85, 247, 0.4);
+  border-radius: 12px;
+  box-shadow:
+    0 20px 40px rgba(0, 0, 0, 0.6),
+    0 0 0 1px rgba(168, 85, 247, 0.15);
+  padding: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+  animation: dd-fade-in 0.15s ease-out;
+}
+
+@keyframes dd-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Stagger options entrance */
+.dd-option {
+  animation: dd-option-in 0.25s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+.dd-option:nth-child(1)  { animation-delay: 0.02s; }
+.dd-option:nth-child(2)  { animation-delay: 0.04s; }
+.dd-option:nth-child(3)  { animation-delay: 0.06s; }
+.dd-option:nth-child(4)  { animation-delay: 0.08s; }
+.dd-option:nth-child(5)  { animation-delay: 0.10s; }
+.dd-option:nth-child(6)  { animation-delay: 0.12s; }
+.dd-option:nth-child(7)  { animation-delay: 0.14s; }
+.dd-option:nth-child(n+8) { animation-delay: 0.16s; }
+
+@keyframes dd-option-in {
+  from { opacity: 0; transform: translateX(8px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* Custom scrollbar */
+.dd-menu::-webkit-scrollbar {
+  width: 8px;
+}
+.dd-menu::-webkit-scrollbar-track {
+  background: transparent;
+}
+.dd-menu::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.3);
+  border-radius: 4px;
+}
+.dd-menu::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.5);
+}
+
+/* Each option */
+.dd-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 14px;
+  cursor: pointer;
+  text-align: right;
+  font-family: inherit;
+  transition: background 0.15s, color 0.15s;
+}
+
+.dd-option:hover {
+  background: rgba(168, 85, 247, 0.15);
+  transform: translateX(-3px);
+}
+
+.dd-option-selected {
+  background: linear-gradient(135deg, #a855f7 0%, #ec4899 100%);
+  box-shadow: 0 4px 12px rgba(168, 85, 247, 0.4);
+}
+
+.dd-option-selected:hover {
+  transform: translateX(-3px);
+  background: linear-gradient(135deg, #9333ea 0%, #db2777 100%);
+}
+
+.dd-option-selected .dd-option-main,
+.dd-option-selected .dd-option-sub {
+  color: #ffffff !important;
+}
+
+.dd-option-main {
+  color: #f1f5f9;
+  font-size: 0.95rem;
+  font-weight: 600;
+  text-align: right;
+  flex: 1;
+}
+
+.dd-option-sub {
+  color: #94a3b8;
+  font-size: 0.78rem;
+  text-align: right;
+}
+
+.dd-option > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: right;
+}
+
+.dd-check {
+  color: #ffffff;
+  font-weight: 700;
+  font-size: 1.1rem;
+  flex-shrink: 0;
+}
+
+/* =====================================================
+   LIGHT THEME OVERRIDES — Cream/Sand palette
+   ===================================================== */
+html[data-theme="light"] .dd-trigger {
+  background-color: #FFFFFF;
+  color: #1A1916;
+  border-color: #E4E0D5;
+}
+
+html[data-theme="light"] .dd-trigger:hover {
+  border-color: #C16342;
+  background-color: #FAF0EC;
+}
+
+html[data-theme="light"] .dd-open .dd-trigger,
+html[data-theme="light"] .dd-trigger:focus {
+  border-color: #C16342;
+  box-shadow:
+    0 0 0 3px rgba(193, 99, 66, 0.15),
+    0 0 20px rgba(193, 99, 66, 0.1);
+}
+
+html[data-theme="light"] .dd-trigger-main {
+  color: #1A1916;
+}
+
+html[data-theme="light"] .dd-trigger-sub {
+  color: #9C9890;
+}
+
+html[data-theme="light"] .dd-arrow {
+  color: #C16342;
+}
+
+html[data-theme="light"] .dd-open .dd-arrow {
+  color: #D4785A;
+}
+
+html[data-theme="light"] .dd-menu {
+  background: #FFFFFF;
+  border-color: #E4E0D5;
+  box-shadow:
+    0 20px 40px rgba(26, 25, 22, 0.12),
+    0 0 0 1px rgba(228, 224, 213, 0.5);
+}
+
+html[data-theme="light"] .dd-menu::-webkit-scrollbar-thumb {
+  background: rgba(193, 99, 66, 0.3);
+}
+
+html[data-theme="light"] .dd-option:hover {
+  background: #FAF0EC;
+}
+
+html[data-theme="light"] .dd-option-main {
+  color: #1A1916;
+}
+
+html[data-theme="light"] .dd-option-sub {
+  color: #9C9890;
+}
+
+html[data-theme="light"] .dd-option-selected {
+  background: linear-gradient(135deg, #C16342 0%, #D4785A 100%);
+  box-shadow: 0 4px 12px rgba(193, 99, 66, 0.35);
+}
+
+html[data-theme="light"] .dd-option-selected:hover {
+  background: linear-gradient(135deg, #A85535 0%, #C16342 100%);
+}

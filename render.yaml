@@ -1,0 +1,43 @@
+# =============================================================
+# Render Blueprint - deploys backend (Docker) + frontend (static)
+# =============================================================
+services:
+  # ---------- Backend (FastAPI + Chrome) ----------
+  - type: web
+    name: x-scraper-backend
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    plan: free   # upgrade to "starter" if free tier is too slow for Selenium
+    region: frankfurt
+    healthCheckPath: /
+    envVars:
+      - key: X_AUTH_TOKEN
+        sync: false   # set in the Render dashboard
+      - key: X_CT0
+        sync: false   # set in the Render dashboard
+      - key: PORT
+        value: 8000
+
+  # ---------- Frontend (Vite static site) ----------
+  - type: web
+    name: x-scraper-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    plan: free
+    region: frankfurt
+    pullRequestPreviewsEnabled: false
+    envVars:
+      # Use the live backend URL once it's deployed
+      - key: VITE_API_URL
+        sync: false   # set to the backend URL, e.g. https://x-scraper-backend.onrender.com
+    headers:
+      - path: /*
+        name: Cache-Control
+        value: public, max-age=0, must-revalidate
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
