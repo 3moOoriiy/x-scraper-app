@@ -26,8 +26,6 @@ services:
     rootDir: frontend
     buildCommand: npm install && npm run build
     staticPublishPath: ./dist
-    plan: free
-    region: frankfurt
     pullRequestPreviewsEnabled: false
     envVars:
       # Use the live backend URL once it's deployed
