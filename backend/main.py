@@ -13,13 +13,16 @@ from scraper import get_posts, search_posts, _shutdown_driver
 
 app = FastAPI(title="X Posts Scraper API")
 
-# Allow React frontend to call this API
+# Allow React frontend to call this API.
+# Note: when allow_origins=["*"] is used, allow_credentials MUST be False
+# otherwise browsers reject the CORS preflight.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origin_regex=".*",   # matches any origin
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 
