@@ -1133,9 +1133,28 @@ def _selenium_search(query, limit=10, mode="keyword",
     # ─── FAST EXTRACTION VIA JAVASCRIPT ──────────────────────────────
     # Pulling each <article> via Selenium WebElement calls is ~10× slower
     # than running one JS query that returns a JSON blob.
+    # We read counts from each button's aria-label individually (more reliable
+    # than the aggregated role="group" aria-label which is often empty for fresh tweets).
     EXTRACT_JS = r"""
     const articles = document.querySelectorAll('article');
     const results = [];
+
+    // Extract a leading number (with optional K/M/B suffix) from an aria-label
+    function numFromAria(el) {
+        if (!el) return 0;
+        const aria = el.getAttribute('aria-label') || '';
+        // Match the FIRST number at the start of the label
+        const m = aria.match(/([\d.,]+\s*[KMB]?)/i);
+        if (!m) return 0;
+        let s = m[1].replace(/[,\s]/g, '');
+        let mult = 1;
+        if (/k$/i.test(s)) { mult = 1000;       s = s.slice(0, -1); }
+        else if (/m$/i.test(s)) { mult = 1000000; s = s.slice(0, -1); }
+        else if (/b$/i.test(s)) { mult = 1000000000; s = s.slice(0, -1); }
+        const n = parseFloat(s);
+        return isNaN(n) ? 0 : Math.round(n * mult);
+    }
+
     for (const art of articles) {
         const timeEl = art.querySelector('time');
         if (!timeEl) continue;
@@ -1146,7 +1165,6 @@ def _selenium_search(query, limit=10, mode="keyword",
         if (!m) continue;
 
         const captionEl = art.querySelector('[data-testid="tweetText"]');
-        const groupEl   = art.querySelector('[role="group"][aria-label]');
         const photoEls  = art.querySelectorAll('[data-testid="tweetPhoto"] img');
 
         const images = [];
@@ -1157,12 +1175,25 @@ def _selenium_search(query, limit=10, mode="keyword",
             }
         });
 
+        // Counts - read from each button's individual aria-label (most reliable)
+        const replyBtn    = art.querySelector('[data-testid="reply"]');
+        const retweetBtn  = art.querySelector('[data-testid="retweet"]')
+                         || art.querySelector('[data-testid="unretweet"]');
+        const likeBtn     = art.querySelector('[data-testid="like"]')
+                         || art.querySelector('[data-testid="unlike"]');
+        // Views: link with /analytics suffix
+        const viewsLink   = art.querySelector('a[href$="/analytics"]')
+                         || art.querySelector('a[role="link"][href*="/analytics"]');
+
         results.push({
             id: m[2],
             author: m[1],
             created_at: timeEl.getAttribute('datetime') || '',
             caption: captionEl ? captionEl.innerText : '',
-            aria: groupEl ? (groupEl.getAttribute('aria-label') || '') : '',
+            comments: numFromAria(replyBtn),
+            retweets: numFromAria(retweetBtn),
+            likes:    numFromAria(likeBtn),
+            views:    numFromAria(viewsLink),
             images: images,
         });
     }
@@ -1189,21 +1220,12 @@ def _selenium_search(query, limit=10, mode="keyword",
                 continue
             author = r.get("author") or "user"
             caption = r.get("caption") or ""
-            aria = r.get("aria") or ""
 
-            # parse counts from aria
-            likes = retweets = comments = views = 0
-            for part in aria.split(","):
-                p = part.strip().lower()
-                mm = re.match(r"([\d.,]+\s*[kmb]?)\s*(.+)", p)
-                if not mm:
-                    continue
-                n = _parse_num(mm.group(1))
-                label = mm.group(2)
-                if   "repl"   in label or "رد"   in label: comments = n
-                elif "repost" in label or "إعاد" in label: retweets = n
-                elif "like"   in label or "إعجاب" in label: likes    = n
-                elif "view"   in label or "مشاهد" in label: views    = n
+            # Counts come straight from each button's aria-label (already parsed in JS)
+            likes    = int(r.get("likes")    or 0)
+            retweets = int(r.get("retweets") or 0)
+            comments = int(r.get("comments") or 0)
+            views    = int(r.get("views")    or 0)
 
             # images: bump to large quality
             image_urls = []
