@@ -1051,19 +1051,21 @@ def _get_driver():
             _DRIVER_READY = False
 
         if not _DRIVER_READY:
-            # One-time cookie injection (warm-up)
+            # One-time cookie injection (warm-up).
+            # Note: X (2024+) REQUIRES login even for /search — guest mode does not work.
+            # If your account has "Translate posts" enabled, X replaces the tweet text
+            # with the translation in the DOM. Disable it from:
+            #   x.com Settings → Accessibility, display and languages → Languages
+            #   → Uncheck "Translate posts"
             try:
                 _DRIVER.get("https://x.com")
                 time.sleep(1.5)
-                # Clear any leftover cookies (e.g. a stale `lang` from a prior session)
                 try:
                     _DRIVER.delete_all_cookies()
                 except Exception:
                     pass
                 _DRIVER.add_cookie({"name": "auth_token", "value": AUTH_TOKEN, "domain": ".x.com", "path": "/"})
                 _DRIVER.add_cookie({"name": "ct0",        "value": CT0,        "domain": ".x.com", "path": "/"})
-                # NOTE: We don't set `lang`. The JS extractor reads from
-                # `[data-testid="tweetText"]` which contains the ORIGINAL text.
                 _DRIVER_READY = True
             except Exception as e:
                 print(f"[Driver warmup] {e}")
@@ -1435,26 +1437,76 @@ def search_posts(query, limit=10, date_filter="all",
             except Exception:
                 pass
 
+    # ─── SMART DATE-RANGE DISTRIBUTION ────────────────────────────────
+    # If user picks a long range (e.g. 6 months), X "Latest" only returns
+    # the newest tweets — we'd never get coverage from earlier months.
+    # Solution: split the range into chunks (~1 month each) and fetch
+    # `limit / num_chunks` posts per chunk.
+    chunks = []  # list of (since_iso, until_iso, label)
     try:
-        # Fetch a bit more than needed so date filter has room (cap at 2000)
-        scrape_target = min(max(limit * 2, 50), 2000)
-        raw = _selenium_search(
-            query,
-            limit=scrape_target,
-            mode=mode,
-            since_date=since_iso,
-            until_date=until_iso,
-        )
-    except Exception as e:
-        print(f"[search_posts] selenium error: {e}")
-        return {"error": "تعذر إجراء البحث. تأكد من تثبيت Chrome.", "posts": []}
+        if since_iso and until_iso:
+            s = datetime.strptime(since_iso, "%Y-%m-%d")
+            u = datetime.strptime(until_iso, "%Y-%m-%d")
+            total_days = (u - s).days
+            if total_days > 35:
+                # Split into ~30-day chunks (working BACKWARDS from newest)
+                cur_end = u
+                while cur_end > s:
+                    cur_start = max(s, cur_end - timedelta(days=30))
+                    chunks.append((
+                        cur_start.strftime("%Y-%m-%d"),
+                        cur_end.strftime("%Y-%m-%d"),
+                        f"{cur_start.strftime('%Y-%m-%d')}..{cur_end.strftime('%Y-%m-%d')}",
+                    ))
+                    cur_end = cur_start
+    except Exception:
+        chunks = []
 
-    # Apply date filters
+    if not chunks:
+        chunks = [(since_iso, until_iso, "single")]
+
+    print(f"[search_posts] Splitting into {len(chunks)} chunk(s) for {limit} posts")
+
+    # Per-chunk target: distribute evenly + 30% buffer for filtering/dedup
+    per_chunk = max(5, int((limit / len(chunks)) * 1.3))
+
+    posts_by_id = {}
+    fetch_error = None
+
+    try:
+        for chunk_idx, (c_since, c_until, label) in enumerate(chunks):
+            # Stop early if we already have enough posts
+            if len(posts_by_id) >= limit:
+                break
+            print(f"[chunk {chunk_idx+1}/{len(chunks)}] {label} -> target {per_chunk}")
+            try:
+                chunk_raw = _selenium_search(
+                    query,
+                    limit=per_chunk,
+                    mode=mode,
+                    since_date=c_since,
+                    until_date=c_until,
+                )
+            except Exception as e:
+                print(f"[chunk {chunk_idx+1}] error: {e}")
+                fetch_error = str(e)
+                continue
+
+            for p in chunk_raw:
+                pid = p.get("post_url", "").split("/")[-1]
+                if pid and pid not in posts_by_id:
+                    posts_by_id[pid] = p
+    except Exception as e:
+        print(f"[search_posts] error: {e}")
+        if not posts_by_id:
+            return {"error": "تعذر إجراء البحث. تأكد من تثبيت Chrome.", "posts": []}
+
+    # Apply date filters (just in case X returns posts outside the range)
     range_start, range_end = get_date_range(specific_date, start_date, end_date)
     threshold = None if (range_start or range_end) else get_date_threshold(date_filter)
 
     filtered = []
-    for p in raw:
+    for p in posts_by_id.values():
         dt = p.get("_dt")
         if not _matches(dt, threshold, range_start, range_end):
             continue
@@ -1463,6 +1515,8 @@ def search_posts(query, limit=10, date_filter="all",
 
     filtered.sort(key=lambda x: x[0] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     posts = [p for _, p in filtered[:limit]]
+
+    print(f"[search_posts] Collected {len(posts)} posts (target was {limit})")
 
     final = {"error": None, "posts": posts}
     _cache_set(cache_key, final)
