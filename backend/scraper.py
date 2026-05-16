@@ -1003,6 +1003,8 @@ def _build_selenium_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--log-level=3")
     opts.add_argument("--window-size=1280,1600")
+    # Note: We force English UI via a `lang=en` cookie injected after navigation,
+    # not via Chrome flags — `--accept-lang` and `--lang` can interfere with X.
     opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.page_load_strategy = "eager"
@@ -1053,8 +1055,15 @@ def _get_driver():
             try:
                 _DRIVER.get("https://x.com")
                 time.sleep(1.5)
+                # Clear any leftover cookies (e.g. a stale `lang` from a prior session)
+                try:
+                    _DRIVER.delete_all_cookies()
+                except Exception:
+                    pass
                 _DRIVER.add_cookie({"name": "auth_token", "value": AUTH_TOKEN, "domain": ".x.com", "path": "/"})
                 _DRIVER.add_cookie({"name": "ct0",        "value": CT0,        "domain": ".x.com", "path": "/"})
+                # NOTE: We don't set `lang`. The JS extractor reads from
+                # `[data-testid="tweetText"]` which contains the ORIGINAL text.
                 _DRIVER_READY = True
             except Exception as e:
                 print(f"[Driver warmup] {e}")
@@ -1133,18 +1142,14 @@ def _selenium_search(query, limit=10, mode="keyword",
     # ─── FAST EXTRACTION VIA JAVASCRIPT ──────────────────────────────
     # Pulling each <article> via Selenium WebElement calls is ~10× slower
     # than running one JS query that returns a JSON blob.
-    # We read counts from each button's aria-label individually (more reliable
-    # than the aggregated role="group" aria-label which is often empty for fresh tweets).
     EXTRACT_JS = r"""
     const articles = document.querySelectorAll('article');
     const results = [];
 
-    // Extract a leading number (with optional K/M/B suffix) from an aria-label
-    function numFromAria(el) {
-        if (!el) return 0;
-        const aria = el.getAttribute('aria-label') || '';
-        // Match the FIRST number at the start of the label
-        const m = aria.match(/([\d.,]+\s*[KMB]?)/i);
+    // Extract a leading number (with optional K/M/B suffix) from a string
+    function numFromStr(str) {
+        if (!str) return 0;
+        const m = String(str).match(/([\d.,]+\s*[KMB]?)/i);
         if (!m) return 0;
         let s = m[1].replace(/[,\s]/g, '');
         let mult = 1;
@@ -1153,6 +1158,39 @@ def _selenium_search(query, limit=10, mode="keyword",
         else if (/b$/i.test(s)) { mult = 1000000000; s = s.slice(0, -1); }
         const n = parseFloat(s);
         return isNaN(n) ? 0 : Math.round(n * mult);
+    }
+
+    function numFromAria(el) {
+        return el ? numFromStr(el.getAttribute('aria-label')) : 0;
+    }
+
+    // Read count: try aria-label, fall back to inner text (the small number under the button)
+    function readCount(btn) {
+        if (!btn) return 0;
+        const fromAria = numFromAria(btn);
+        if (fromAria > 0) return fromAria;
+        // Fallback to visible text (might be empty for new tweets)
+        const txt = (btn.innerText || btn.textContent || '').trim();
+        return numFromStr(txt);
+    }
+
+    // Extract ORIGINAL caption text — skip any "Show translation" button or translated content
+    function getOriginalCaption(art) {
+        // X renders the translated text in a separate block with data-testid="tweetText"
+        // The ORIGINAL is always in the FIRST tweetText element of the article
+        const all = art.querySelectorAll('[data-testid="tweetText"]');
+        if (all.length === 0) return '';
+        // Pick the first one (original is rendered first; translation appears below)
+        let txt = '';
+        all[0].childNodes.forEach(node => {
+            // Skip the "Show translation" / "Translate post" button if present inside
+            if (node.nodeType === 1) {
+                const t = (node.innerText || node.textContent || '');
+                if (/show translation|translate this post|اعرض الترجمة|عرض الترجمة|ترجم/i.test(t)) return;
+            }
+            txt += (node.textContent || '');
+        });
+        return txt || (all[0].innerText || '');
     }
 
     for (const art of articles) {
@@ -1164,9 +1202,7 @@ def _selenium_search(query, limit=10, mode="keyword",
         const m = href.match(/\/([^/]+)\/status\/(\d+)/);
         if (!m) continue;
 
-        const captionEl = art.querySelector('[data-testid="tweetText"]');
-        const photoEls  = art.querySelectorAll('[data-testid="tweetPhoto"] img');
-
+        const photoEls = art.querySelectorAll('[data-testid="tweetPhoto"] img');
         const images = [];
         photoEls.forEach(img => {
             const s = img.getAttribute('src') || '';
@@ -1175,25 +1211,50 @@ def _selenium_search(query, limit=10, mode="keyword",
             }
         });
 
-        // Counts - read from each button's individual aria-label (most reliable)
+        // Counts - try multiple strategies
         const replyBtn    = art.querySelector('[data-testid="reply"]');
         const retweetBtn  = art.querySelector('[data-testid="retweet"]')
                          || art.querySelector('[data-testid="unretweet"]');
         const likeBtn     = art.querySelector('[data-testid="like"]')
                          || art.querySelector('[data-testid="unlike"]');
-        // Views: link with /analytics suffix
         const viewsLink   = art.querySelector('a[href$="/analytics"]')
                          || art.querySelector('a[role="link"][href*="/analytics"]');
+
+        // Strategy 1: per-button aria-label / inner text
+        let comments = readCount(replyBtn);
+        let retweets = readCount(retweetBtn);
+        let likes    = readCount(likeBtn);
+        let views    = readCount(viewsLink);
+
+        // Strategy 2: fall back to aggregated role="group" aria-label
+        //   "2 replies, 4 reposts, 5 likes, 83 views"
+        if (comments === 0 && retweets === 0 && likes === 0 && views === 0) {
+            const groupEl = art.querySelector('[role="group"][aria-label]');
+            const aria = groupEl ? (groupEl.getAttribute('aria-label') || '') : '';
+            if (aria) {
+                aria.split(',').forEach(part => {
+                    const p = part.trim().toLowerCase();
+                    const mm = p.match(/([\d.,]+\s*[kmb]?)\s*(.+)/i);
+                    if (!mm) return;
+                    const n = numFromStr(mm[1]);
+                    const lbl = mm[2];
+                    if      (/repl/.test(lbl)   || /رد/.test(lbl))    comments = comments || n;
+                    else if (/repost/.test(lbl) || /إعاد/.test(lbl)) retweets = retweets || n;
+                    else if (/like/.test(lbl)   || /إعجاب/.test(lbl)) likes    = likes    || n;
+                    else if (/view/.test(lbl)   || /مشاهد/.test(lbl)) views    = views    || n;
+                });
+            }
+        }
 
         results.push({
             id: m[2],
             author: m[1],
             created_at: timeEl.getAttribute('datetime') || '',
-            caption: captionEl ? captionEl.innerText : '',
-            comments: numFromAria(replyBtn),
-            retweets: numFromAria(retweetBtn),
-            likes:    numFromAria(likeBtn),
-            views:    numFromAria(viewsLink),
+            caption: getOriginalCaption(art),
+            comments: comments,
+            retweets: retweets,
+            likes:    likes,
+            views:    views,
             images: images,
         });
     }
