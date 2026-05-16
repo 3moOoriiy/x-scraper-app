@@ -6,9 +6,11 @@
 
 import json
 import html
+import math
 import re
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -1083,6 +1085,83 @@ def _shutdown_driver():
             _DRIVER_READY = False
 
 
+# =============================================================
+# SYNDICATION CDN - returns ORIGINAL tweet text (no translation)
+# This bypasses X's account-level auto-translate setting.
+# =============================================================
+
+# Shared session for syndication calls (keep-alive for speed)
+_SYND_SESSION = requests.Session()
+_SYND_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+})
+
+
+def _make_syndication_token(tweet_id):
+    """Generate the obscure token X requires for syndication API calls."""
+    try:
+        n = int(tweet_id) / 1e15 * math.pi
+        return format(n, "f").replace(".", "").rstrip("0")[:11]
+    except Exception:
+        return ""
+
+
+def _fetch_original_tweet(tweet_id):
+    """
+    Fetch a single tweet from the syndication CDN.
+    Returns: {text, lang, screen_name, created_at, likes, retweets, replies}
+             or None on failure.
+    """
+    if not tweet_id:
+        return None
+    token = _make_syndication_token(tweet_id)
+    url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token={token}"
+    try:
+        r = _SYND_SESSION.get(url, timeout=8)
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        return {
+            "text":        d.get("text") or "",
+            "lang":        d.get("lang") or "",
+            "screen_name": (d.get("user") or {}).get("screen_name") or "",
+            "created_at":  d.get("created_at") or "",
+            "likes":       int(d.get("favorite_count") or 0),
+            "retweets":    int(d.get("conversation_count") or 0),
+        }
+    except Exception:
+        return None
+
+
+def _enrich_with_originals(posts, max_workers=10):
+    """
+    For each post, fetch its ORIGINAL text from the syndication CDN.
+    Runs in parallel (threaded) for speed.
+    Updates posts in-place; safe if a fetch fails (keeps existing caption).
+    """
+    if not posts:
+        return posts
+
+    def _enrich(post):
+        tid = (post.get("post_url") or "").split("/")[-1]
+        if not tid:
+            return
+        orig = _fetch_original_tweet(tid)
+        if not orig:
+            return
+        # Only replace if syndication returned non-empty text
+        if orig["text"]:
+            post["caption"] = orig["text"]
+        # Likes/retweets from syndication are often more accurate
+        if orig["likes"] > post.get("likes", 0):
+            post["likes"] = orig["likes"]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        list(ex.map(_enrich, posts))
+    return posts
+
+
 def _selenium_search(query, limit=10, mode="keyword",
                      since_date=None, until_date=None):
     """
@@ -1517,6 +1596,16 @@ def search_posts(query, limit=10, date_filter="all",
     posts = [p for _, p in filtered[:limit]]
 
     print(f"[search_posts] Collected {len(posts)} posts (target was {limit})")
+
+    # ─── Replace captions with ORIGINAL language via Syndication CDN ─────
+    # This bypasses X's account-level auto-translate (which replaces tweet
+    # text with the translation in the DOM). Runs in parallel threads.
+    if posts:
+        print(f"[search_posts] Fetching original captions for {len(posts)} posts...")
+        try:
+            _enrich_with_originals(posts, max_workers=15)
+        except Exception as e:
+            print(f"[search_posts] enrich error: {e}")
 
     final = {"error": None, "posts": posts}
     _cache_set(cache_key, final)
