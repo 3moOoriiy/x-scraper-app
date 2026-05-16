@@ -188,10 +188,11 @@ function App() {
     window.open(url, '_blank')
   }
 
+  // Show the FULL number (e.g. 1900 instead of "1.9K", 2,500,000 instead of "2.5M")
+  // with grouping separators for readability.
   const formatNumber = (n) => {
-    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M'
-    if (n >= 1000) return (n / 1000).toFixed(1) + 'K'
-    return n.toString()
+    const num = Number(n) || 0
+    return num.toLocaleString('en-US')
   }
 
   const formatDate = (iso) => {

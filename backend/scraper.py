@@ -24,10 +24,10 @@ _LAST_REQUEST_TIME = 0.0
 _MIN_DELAY_SEC = 0.3   # was 1.0 — X tolerates faster bursts with auth cookies
 
 _CACHE = {}
-_CACHE_TTL = 120                # 2 min — instant for repeats
+_CACHE_TTL = 20                 # 20 sec — fresh counts for actively-growing tweets
 
 _TWEETS_CACHE = {}
-_TWEETS_CACHE_TTL = 120         # 2 min
+_TWEETS_CACHE_TTL = 20          # 20 sec
 _TWEETS_CACHE_STALE_TTL = 3600  # 1 hour fallback during rate limits
 
 _RATE_LIMIT_UNTIL = 0.0
@@ -85,6 +85,7 @@ CT0 = os.environ.get("X_CT0") or (
 USER_BY_SCREEN_NAME_ID = "G3KGOASz96M-Qu0nwmGXNg"
 USER_TWEETS_ID         = "E3opETHurmVJflFsUBVuUQ"
 SEARCH_TIMELINE_ID     = "nK1dw4o2ttv4nlxoyKr_lQ"
+TWEET_BY_REST_ID       = "0hWvDhmW8YQ-S_ib3azIrw"   # TweetResultByRestId — live engagement counts
 
 GRAPHQL_BASE = "https://api.x.com/graphql"
 DEFAULT_TIMEOUT = 30
@@ -660,18 +661,50 @@ def extract_tweet_data(tweet_result, username):
         else:
             post_type = "post"
 
-        likes    = int(legacy.get("favorite_count", 0) or 0)
-        retweets = int(legacy.get("retweet_count", 0) or 0)
-        comments = int(legacy.get("reply_count", 0) or 0)
+        # ── Engagement counts ─────────────────────────────────────────
+        # For RETWEETS we must read the ORIGINAL tweet's counts, not the
+        # retweet wrapper's. The retweet wrapper has favorite_count=0,
+        # retweet_count=0, reply_count=0 — but X displays the original
+        # tweet's numbers in the user's timeline. Using wrapper counts
+        # produces wildly wrong values (often 0 or single digits) for
+        # retweeted popular posts.
+        engagement_legacy = legacy
+        engagement_views_obj = tweet_result.get("views", {}) or {}
+        if is_retweet:
+            rt_result = ((legacy.get("retweeted_status_result") or {}).get("result") or {})
+            if rt_result.get("__typename") == "TweetWithVisibilityResults":
+                rt_result = rt_result.get("tweet", {}) or {}
+            rt_legacy = rt_result.get("legacy") or {}
+            if rt_legacy:
+                engagement_legacy = rt_legacy
+                # Original tweet's views are on rt_result, not its legacy
+                rt_views = rt_result.get("views", {}) or {}
+                if rt_views.get("count") is not None:
+                    engagement_views_obj = rt_views
+
+        likes    = int(engagement_legacy.get("favorite_count", 0) or 0)
+        retweets = int(engagement_legacy.get("retweet_count", 0) or 0)
+        comments = int(engagement_legacy.get("reply_count", 0) or 0)
 
         views = 0
-        v_obj = tweet_result.get("views", {}) or {}
-        v_count = v_obj.get("count")
+        v_count = engagement_views_obj.get("count")
         if v_count is not None:
             try:
                 views = int(v_count)
             except (ValueError, TypeError):
                 pass
+
+        # Original tweet ID (for retweets) — used by the syndication CDN
+        # enrichment, since the retweet ID itself isn't in the CDN.
+        original_tweet_id = tweet_id
+        if is_retweet:
+            rt_result = ((legacy.get("retweeted_status_result") or {}).get("result") or {})
+            if rt_result.get("__typename") == "TweetWithVisibilityResults":
+                rt_result = rt_result.get("tweet", {}) or {}
+            rt_legacy = rt_result.get("legacy") or {}
+            orig_id = rt_legacy.get("id_str") or rt_result.get("rest_id")
+            if orig_id:
+                original_tweet_id = orig_id
 
         dt = parse_twitter_date(legacy.get("created_at", ""))
         created_at_iso = dt.isoformat() if dt else ""
@@ -692,6 +725,7 @@ def extract_tweet_data(tweet_result, username):
             "has_video": has_video,
             "quoted_author": quoted_author,
             "quoted_caption": quoted_caption,
+            "_original_tweet_id": original_tweet_id,  # for CDN enrichment
             "created_at": created_at_iso,
             "_dt": dt,
         }
@@ -1083,6 +1117,63 @@ def _shutdown_driver():
             except Exception: pass
             _DRIVER = None
             _DRIVER_READY = False
+    # Also shut down the pool
+    with _POOL_LOCK:
+        while _DRIVER_POOL:
+            drv = _DRIVER_POOL.pop()
+            try: drv.quit()
+            except Exception: pass
+
+
+# =============================================================
+# DRIVER POOL — for parallel chunked searches
+# =============================================================
+_DRIVER_POOL = []          # idle drivers available for checkout
+_POOL_LOCK = threading.Lock()
+_POOL_MAX = 3              # max concurrent drivers (each = 1 Chrome process)
+
+
+def _build_warmed_driver():
+    """Create a driver and inject auth cookies (ready to search)."""
+    d = _build_selenium_driver()
+    try:
+        d.get("https://x.com")
+        time.sleep(1.2)
+        try: d.delete_all_cookies()
+        except Exception: pass
+        d.add_cookie({"name": "auth_token", "value": AUTH_TOKEN, "domain": ".x.com", "path": "/"})
+        d.add_cookie({"name": "ct0",        "value": CT0,        "domain": ".x.com", "path": "/"})
+    except Exception as e:
+        print(f"[Pool driver warmup] {e}")
+    return d
+
+
+def _checkout_driver():
+    """Get a driver from the pool, creating one if none idle and below cap."""
+    with _POOL_LOCK:
+        if _DRIVER_POOL:
+            return _DRIVER_POOL.pop()
+    # Build outside the lock — Chrome startup is slow
+    return _build_warmed_driver()
+
+
+def _return_driver(d):
+    """Return a driver to the pool, capped at _POOL_MAX."""
+    if d is None:
+        return
+    # Verify the driver is alive
+    try:
+        _ = d.title
+    except Exception:
+        try: d.quit()
+        except Exception: pass
+        return
+    with _POOL_LOCK:
+        if len(_DRIVER_POOL) < _POOL_MAX:
+            _DRIVER_POOL.append(d)
+            return
+    try: d.quit()
+    except Exception: pass
 
 
 # =============================================================
@@ -1107,28 +1198,263 @@ def _make_syndication_token(tweet_id):
         return ""
 
 
+def _safe_int(v):
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _hq_image(url):
+    """Upgrade any pbs.twimg.com image URL to large/original quality."""
+    if not url:
+        return url
+    base = url.split("?")[0]
+    # Strip any existing &name=... query
+    return f"{base}?format=jpg&name=large"
+
+
+def _extract_media_from_cdn(d):
+    """
+    Pull ALL image + video URLs from a syndication-CDN response.
+    Looks at every known media field — covers single photos, 2-4 photo
+    grids, videos, animated GIFs, AND media inside a quoted tweet.
+
+    Returns (image_urls, video_urls, has_video).
+    """
+    image_urls = []
+    video_urls = []
+    has_video = False
+    seen_imgs = set()
+    seen_vids = set()
+
+    def _push_img(u):
+        u = _hq_image(u)
+        if u and u not in seen_imgs:
+            seen_imgs.add(u)
+            image_urls.append(u)
+
+    def _push_vid(u):
+        if u and u not in seen_vids:
+            seen_vids.add(u)
+            video_urls.append(u)
+
+    def _process_media_array(arr):
+        nonlocal has_video
+        for m in (arr or []):
+            if not isinstance(m, dict):
+                continue
+            mtype = (m.get("type") or "").lower()
+            # 1) photo thumbnail / preview (every media item has this)
+            img_url = (m.get("media_url_https")
+                       or m.get("media_url")
+                       or m.get("url"))
+            if img_url:
+                _push_img(img_url)
+            # 2) video / animated-gif: pick highest-bitrate mp4 variant
+            if mtype in ("video", "animated_gif"):
+                has_video = True
+                variants = ((m.get("video_info") or {}).get("variants")
+                            or m.get("variants") or [])
+                mp4s = [v for v in variants
+                        if (v.get("content_type") or v.get("type") or "") == "video/mp4"]
+                if mp4s:
+                    best = max(mp4s, key=lambda v: v.get("bitrate", 0) or 0)
+                    _push_vid(best.get("url") or best.get("src"))
+
+    # ── Primary media payload ───────────────────────────────
+    _process_media_array(d.get("mediaDetails"))
+
+    # ── Fallback `photos` array (older schema) ──────────────
+    for p in (d.get("photos") or []):
+        if isinstance(p, dict):
+            _push_img(p.get("url"))
+
+    # ── Top-level video object (some embedded tweets) ───────
+    v = d.get("video")
+    if isinstance(v, dict):
+        has_video = True
+        _push_img(v.get("poster"))
+        for vr in (v.get("variants") or []):
+            if (vr.get("type") or vr.get("content_type") or "") == "video/mp4":
+                _push_vid(vr.get("src") or vr.get("url"))
+
+    # ── Quoted tweet media ──────────────────────────────────
+    q = d.get("quoted_tweet") or d.get("quotedStatus") or {}
+    if isinstance(q, dict) and q:
+        _process_media_array(q.get("mediaDetails"))
+        for p in (q.get("photos") or []):
+            if isinstance(p, dict):
+                _push_img(p.get("url"))
+
+    return image_urls, video_urls, has_video
+
+
 def _fetch_original_tweet(tweet_id):
     """
-    Fetch a single tweet from the syndication CDN.
-    Returns: {text, lang, screen_name, created_at, likes, retweets, replies}
-             or None on failure.
+    Fetch a single tweet from X's syndication CDN. Returns:
+        text, lang, screen_name, created_at,
+        likes (favorite_count — EXACT integer),
+        replies (conversation_count — EXACT integer),
+        retweets (retweet_count if present, else 0),
+        views (multiple possible keys),
+        image_urls, video_urls, has_video.
+
+    The CDN returns EXACT counts — not the rounded "1.9K" you see on x.com.
     """
     if not tweet_id:
         return None
     token = _make_syndication_token(tweet_id)
-    url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token={token}"
-    try:
-        r = _SYND_SESSION.get(url, timeout=8)
-        if r.status_code != 200:
+    url = (
+        f"https://cdn.syndication.twimg.com/tweet-result"
+        f"?id={tweet_id}&token={token}&lang=en"
+    )
+    # Retry once on transient 404 (CDN edge cache warm-up on fresh tweets)
+    d = None
+    for attempt in range(2):
+        try:
+            r = _SYND_SESSION.get(url, timeout=8)
+            if r.status_code == 200:
+                d = r.json()
+                break
+            if r.status_code == 404 and attempt == 0:
+                time.sleep(0.6)
+                continue
             return None
-        d = r.json()
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.4)
+                continue
+            return None
+    if d is None or not isinstance(d, dict):
+        return None
+    try:
+        # ── Views: try every known key X has used over the years ──
+        views = 0
+        for k in ("view_count", "views_count", "ext_view_count"):
+            v = d.get(k)
+            if v:
+                views = _safe_int(v)
+                break
+        if not views:
+            v_obj = d.get("views") or d.get("ext_views")
+            if isinstance(v_obj, dict):
+                views = _safe_int(v_obj.get("count") or v_obj.get("state"))
+            elif v_obj:
+                views = _safe_int(v_obj)
+
+        image_urls, video_urls, has_video = _extract_media_from_cdn(d)
+
         return {
             "text":        d.get("text") or "",
             "lang":        d.get("lang") or "",
             "screen_name": (d.get("user") or {}).get("screen_name") or "",
             "created_at":  d.get("created_at") or "",
-            "likes":       int(d.get("favorite_count") or 0),
-            "retweets":    int(d.get("conversation_count") or 0),
+            "likes":       _safe_int(d.get("favorite_count")),
+            "replies":     _safe_int(d.get("conversation_count")),
+            "retweets":    _safe_int(d.get("retweet_count")),
+            "views":       _safe_int(views),
+            "image_urls":  image_urls,
+            "video_urls":  video_urls,
+            "has_video":   has_video,
+        }
+    except Exception as e:
+        print(f"[CDN parse] {tweet_id}: {e}")
+        return None
+
+
+# =============================================================
+# LIVE COUNT REFRESH via GraphQL TweetResultByRestId
+# =============================================================
+# The syndication CDN ages ~30-300s. For "live" matching what X.com
+# shows at this moment, we hit the authenticated GraphQL endpoint
+# which returns fresh counts for each tweet ID.
+
+_LIVE_SESSION = None
+_LIVE_SESSION_LOCK = threading.Lock()
+
+
+def _get_live_session():
+    """Build (once) an authenticated session for the GraphQL refresh path."""
+    global _LIVE_SESSION
+    with _LIVE_SESSION_LOCK:
+        if _LIVE_SESSION is None:
+            _LIVE_SESSION = build_session(use_guest=False)
+    return _LIVE_SESSION
+
+
+_LIVE_FEATURES = {
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "premium_content_api_read_enabled": False,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+    "responsive_web_grok_analyze_post_followups_enabled": False,
+    "responsive_web_jetfuel_frame": False,
+    "responsive_web_grok_share_attachment_enabled": True,
+    "articles_preview_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "view_counts_everywhere_api_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "tweet_awards_web_tipping_enabled": False,
+    "creator_subscriptions_quote_tweet_preview_enabled": False,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "rweb_tipjar_consumption_enabled": True,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "verified_phone_label_enabled": False,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_enhance_cards_enabled": False,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "profile_label_improvements_pcf_label_in_post_enabled": True,
+}
+
+
+def _fetch_tweet_live(tweet_id):
+    """
+    Live engagement counts for a single tweet via the authenticated
+    GraphQL TweetResultByRestId endpoint. Returns
+        {likes, retweets, comments, views}
+    or None on any error. Bypasses the syndication-CDN edge cache.
+    """
+    if not tweet_id:
+        return None
+    session = _get_live_session()
+    variables = {
+        "tweetId": str(tweet_id),
+        "withCommunity": False,
+        "includePromotedContent": False,
+        "withVoice": False,
+    }
+    url = f"{GRAPHQL_BASE}/{TWEET_BY_REST_ID}/TweetResultByRestId"
+    params = {
+        "variables": json.dumps(variables, separators=(",", ":")),
+        "features":  json.dumps(_LIVE_FEATURES, separators=(",", ":")),
+    }
+    try:
+        r = session.get(url, params=params, timeout=8)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        tw = (data.get("data") or {}).get("tweetResult", {}).get("result", {})
+        if not tw:
+            return None
+        if tw.get("__typename") == "TweetWithVisibilityResults":
+            tw = tw.get("tweet", {})
+        legacy = tw.get("legacy") or {}
+        if not legacy:
+            return None
+        views = tw.get("views") or {}
+        return {
+            "likes":    _safe_int(legacy.get("favorite_count")),
+            "retweets": _safe_int(legacy.get("retweet_count")),
+            "comments": _safe_int(legacy.get("reply_count")),
+            "views":    _safe_int(views.get("count")),
         }
     except Exception:
         return None
@@ -1136,26 +1462,97 @@ def _fetch_original_tweet(tweet_id):
 
 def _enrich_with_originals(posts, max_workers=10):
     """
-    For each post, fetch its ORIGINAL text from the syndication CDN.
-    Runs in parallel (threaded) for speed.
-    Updates posts in-place; safe if a fetch fails (keeps existing caption).
+    For every post: fetch authoritative data from X's syndication CDN and
+    merge into the existing post dict.
+
+    Merge rules
+    ─ Caption: replace with CDN text if non-empty (bypasses auto-translate).
+    ─ Counts : take MAX(DOM, CDN). DOM may be rounded ("1.9K" → 1900);
+              CDN gives EXACT ("1923"). Whichever is higher is the truth.
+              When DOM is 0 (fresh tweet, counters not rendered) and CDN
+              has the real number, this picks the CDN value.
+    ─ Media  : UNION (CDN images + DOM images, deduped). The CDN is the
+              authoritative source for media — it lists every image and
+              video URL even if X collapsed some in the feed view.
     """
     if not posts:
         return posts
 
     def _enrich(post):
-        tid = (post.get("post_url") or "").split("/")[-1]
+        # For retweets the CDN doesn't index the retweet wrapper — fetch the
+        # ORIGINAL tweet (we stashed its id during extraction).
+        tid = (
+            post.get("_original_tweet_id")
+            or (post.get("post_url") or "").split("/")[-1]
+        )
         if not tid:
             return
+
+        # ── Hit BOTH sources in this thread:
+        #    1. Syndication CDN — gives original text + media metadata
+        #    2. GraphQL TweetResultByRestId — gives LIVE engagement counts
+        #       (the X account-authenticated GraphQL is not edge-cached)
         orig = _fetch_original_tweet(tid)
-        if not orig:
+        live = _fetch_tweet_live(tid)
+
+        if not orig and not live:
             return
-        # Only replace if syndication returned non-empty text
-        if orig["text"]:
+
+        # 1) Caption — replace with original text from CDN (bypass auto-translate)
+        if orig and orig["text"]:
             post["caption"] = orig["text"]
-        # Likes/retweets from syndication are often more accurate
-        if orig["likes"] > post.get("likes", 0):
-            post["likes"] = orig["likes"]
+
+        # 2) Counts — take the MAXIMUM across DOM, CDN, and LIVE GraphQL.
+        #    LIVE GraphQL is fresh; DOM may be rounded; CDN may be stale.
+        #    Max never goes backwards from what we already had.
+        def _max3(dom_v, cdn_v, live_v):
+            return max(_safe_int(dom_v), _safe_int(cdn_v), _safe_int(live_v))
+
+        post["likes"] = _max3(
+            post.get("likes"),
+            (orig or {}).get("likes", 0),
+            (live or {}).get("likes", 0),
+        )
+        post["comments"] = _max3(
+            post.get("comments"),
+            (orig or {}).get("replies", 0),
+            (live or {}).get("comments", 0),
+        )
+        post["retweets"] = _max3(
+            post.get("retweets"),
+            (orig or {}).get("retweets", 0),
+            (live or {}).get("retweets", 0),
+        )
+        post["views"] = _max3(
+            post.get("views"),
+            (orig or {}).get("views", 0),
+            (live or {}).get("views", 0),
+        )
+
+        # 3) Media — UNION of DOM images + CDN images (CDN is authoritative
+        # for completeness; DOM may have caught images the CDN missed).
+        if orig:
+            existing_imgs = list(post.get("image_urls") or [])
+            existing_vids = list(post.get("video_urls") or [])
+            seen_v = set(existing_vids)
+            norm_imgs = []
+            for u in existing_imgs:
+                hq = _hq_image(u)
+                if hq not in [_hq_image(x) for x in norm_imgs]:
+                    norm_imgs.append(hq)
+            for u in orig["image_urls"]:
+                if u not in [_hq_image(x) for x in norm_imgs]:
+                    norm_imgs.append(u)
+            post["image_urls"] = norm_imgs
+            for v in orig["video_urls"]:
+                if v not in seen_v:
+                    existing_vids.append(v)
+                    seen_v.add(v)
+            post["video_urls"] = existing_vids
+            if orig["has_video"]:
+                post["has_video"] = True
+                if post.get("post_type") == "post":
+                    post["post_type"] = "video"
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         list(ex.map(_enrich, posts))
@@ -1163,10 +1560,12 @@ def _enrich_with_originals(posts, max_workers=10):
 
 
 def _selenium_search(query, limit=10, mode="keyword",
-                     since_date=None, until_date=None):
+                     since_date=None, until_date=None,
+                     driver=None):
     """
     Use Selenium to scrape x.com/search?q=... (Latest tab).
-    Uses a persistent driver to skip Chrome startup time on every request.
+    If `driver` is provided we use it (caller owns the lifecycle); otherwise
+    we use the singleton from `_get_driver()`.
     """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
@@ -1191,7 +1590,8 @@ def _selenium_search(query, limit=10, mode="keyword",
     url = f"https://x.com/search?q={encoded}&src=typed_query&f=live"
     print(f"[Selenium search] URL: {url}")
 
-    driver = _get_driver()
+    if driver is None:
+        driver = _get_driver()
 
     # Open the search results page (cookies were injected once in _get_driver)
     try:
@@ -1204,12 +1604,22 @@ def _selenium_search(query, limit=10, mode="keyword",
         WebDriverWait(driver, 18).until(
             EC.presence_of_element_located((By.TAG_NAME, "article"))
         )
+        # Settle so the engagement counters finish their 0→target animation.
+        # X uses an animated transition span; reading mid-animation returns
+        # a partial value (e.g. 794 on a tweet that ultimately shows 1626).
+        # 1.6s reliably catches the final value for all counts < 1M.
+        time.sleep(1.6)
     except TimeoutException:
         page_src = driver.page_source.lower()
         if "no results for" in page_src or "لا توجد نتائج" in page_src:
             print("[Selenium search] X says: no results")
         elif "rate limit" in page_src or "تم تجاوز" in page_src:
-            print("[Selenium search] X says: rate limit hit")
+            print("[Selenium search] X says: rate limit hit — backing off 30s")
+            time.sleep(30)
+        elif ("are you a robot" in page_src or "verify you are human" in page_src
+              or "unusual activity" in page_src or "automated" in page_src):
+            print("[Selenium search] X is showing anti-bot verify page — backing off 30s")
+            time.sleep(30)
         elif "log in" in page_src or "sign in" in page_src or "sign up" in page_src:
             print("[Selenium search] X requires login (cookies might be invalid)")
         else:
@@ -1227,9 +1637,18 @@ def _selenium_search(query, limit=10, mode="keyword",
     const articles = document.querySelectorAll('article');
     const results = [];
 
+    // Normalize Arabic-Indic and Persian digits to ASCII 0-9.
+    function asciiDigits(s) {
+        if (!s) return '';
+        return String(s)
+            .replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 0x0660))
+            .replace(/[۰-۹]/g, d => String(d.charCodeAt(0) - 0x06F0));
+    }
+
     function numFromStr(str) {
         if (!str) return 0;
-        const m = String(str).match(/([\d.,]+\s*[KMB]?)/i);
+        const s0 = asciiDigits(str);
+        const m = s0.match(/([\d.,]+\s*[KMB]?)/i);
         if (!m) return 0;
         let s = m[1].replace(/[,\s]/g, '');
         let mult = 1;
@@ -1240,46 +1659,43 @@ def _selenium_search(query, limit=10, mode="keyword",
         return isNaN(n) ? 0 : Math.round(n * mult);
     }
 
-    // Find the VISIBLE count inside a button container by reading
-    // the `app-text-transition-container` span — that's the exact number
-    // X renders to the user.
-    function readButtonCount(btn) {
-        if (!btn) return 0;
-        // Strategy 1: the animated counter span (most accurate)
-        const anim = btn.querySelector('[data-testid="app-text-transition-container"]');
-        if (anim) {
-            const t = (anim.innerText || anim.textContent || '').trim();
-            const n = numFromStr(t);
-            if (n > 0) return n;
-        }
-        // Strategy 2: visible inner text of the button
-        const txt = (btn.innerText || btn.textContent || '').trim();
-        const fromText = numFromStr(txt);
-        if (fromText > 0) return fromText;
-        // Strategy 3: aria-label ("5 Likes. Like" → 5)
-        const aria = btn.getAttribute('aria-label') || '';
-        return numFromStr(aria);
+    // Read the EXACT count from aria-label. X always renders the full count
+    // there (e.g. "1,626 Views. View" / "13 Likes. Like" / "0 Replies. Reply")
+    // — even before any visible counter animation finishes. Walking inner
+    // spans/text is unreliable because relative timestamps ("3m", "2h") in
+    // the same DOM scope get mis-parsed as counts.
+    function ariaCount(el) {
+        if (!el) return 0;
+        return numFromStr(el.getAttribute('aria-label') || '');
     }
 
-    // Views: it's an <a href=".../analytics"> not a button
+    function readButtonCount(btn) { return ariaCount(btn); }
+
     function readViewCount(art) {
-        // Strategy 1: animated counter inside the analytics link
-        const link = art.querySelector('a[href$="/analytics"]')
-                  || art.querySelector('a[role="link"][href*="/analytics"]');
-        if (link) {
-            const anim = link.querySelector('[data-testid="app-text-transition-container"]');
-            if (anim) {
-                const n = numFromStr(anim.innerText || anim.textContent || '');
-                if (n > 0) return n;
-            }
-            const txt = (link.innerText || link.textContent || '').trim();
-            const fromText = numFromStr(txt);
-            if (fromText > 0) return fromText;
-            const aria = link.getAttribute('aria-label') || '';
-            const fromAria = numFromStr(aria);
-            if (fromAria > 0) return fromAria;
+        const grp = art.querySelector('[role="group"]') || art;
+        let best = 0;
+
+        // 1) Action-group aria-label is the most reliable single string
+        //    e.g. "6 reposts, 8 likes, 5 bookmarks, 181 views"
+        const grpAria = asciiDigits(grp.getAttribute('aria-label') || '').toLowerCase();
+        if (grpAria) {
+            const m = grpAria.match(/([\d,.]+\s*[kmb]?)\s*(?:view|مشاهد)/i);
+            if (m) best = Math.max(best, numFromStr(m[1]));
         }
-        return 0;
+
+        // 2) The analytics anchor — usually no aria-label, but its
+        //    textContent is "163 Views" / "1.6K Views" / "١٦٣ مشاهد..."
+        const linkCandidates = [
+            grp.querySelector('a[href$="/analytics"]'),
+            grp.querySelector('a[role="link"][href*="/analytics"]'),
+            grp.querySelector('[data-testid="analyticsLink"]'),
+        ].filter(Boolean);
+        for (const el of linkCandidates) {
+            best = Math.max(best, numFromStr(el.getAttribute('aria-label') || ''));
+            best = Math.max(best, numFromStr((el.textContent || '').trim()));
+        }
+
+        return best;
     }
 
     // Extract ORIGINAL caption text — skip any "Show translation" button or translated content
@@ -1310,45 +1726,63 @@ def _selenium_search(query, limit=10, mode="keyword",
         const m = href.match(/\/([^/]+)\/status\/(\d+)/);
         if (!m) continue;
 
-        const photoEls = art.querySelectorAll('[data-testid="tweetPhoto"] img');
+        // Capture EVERY image in the tweet — including multi-photo grids,
+        // link-preview card thumbnails, and images inside a quoted tweet.
         const images = [];
-        photoEls.forEach(img => {
-            const s = img.getAttribute('src') || '';
-            if (s && !s.includes('profile_images') && !s.includes('emoji')) {
+        const seen = new Set();
+        const imgSelectors = [
+            '[data-testid="tweetPhoto"] img',          // normal photos (1-4 grid)
+            '[data-testid="card.wrapper"] img',         // link-preview cards
+            '[data-testid="card.layoutLarge.media"] img',
+            '[data-testid="card.layoutSmall.media"] img',
+            'a[href*="/photo/"] img',                   // any clickable photo
+            'div[aria-label="Image"] img',
+            'img[src*="pbs.twimg.com/media"]',          // catch-all by URL
+        ];
+        imgSelectors.forEach(sel => {
+            art.querySelectorAll(sel).forEach(img => {
+                const s = img.getAttribute('src') || '';
+                if (!s) return;
+                if (s.includes('profile_images')) return;   // skip avatars
+                if (s.includes('emoji')) return;            // skip emoji glyphs
+                if (s.includes('semantic_core_img')) return;// skip ad/feature icons
+                if (seen.has(s)) return;
+                seen.add(s);
                 images.push(s);
-            }
+            });
         });
 
-        // Counts: read VISIBLE numbers directly from each button
-        const replyBtn   = art.querySelector('[data-testid="reply"]');
-        const retweetBtn = art.querySelector('[data-testid="retweet"]')
-                       || art.querySelector('[data-testid="unretweet"]');
-        const likeBtn    = art.querySelector('[data-testid="like"]')
-                       || art.querySelector('[data-testid="unlike"]');
+        // Counts: scope to the action `role="group"` so we read the OUTER
+        // tweet's buttons, never a quoted-tweet's buttons.
+        const actionGroup = art.querySelector('[role="group"]') || art;
+        const replyBtn   = actionGroup.querySelector('[data-testid="reply"]');
+        const retweetBtn = actionGroup.querySelector('[data-testid="retweet"]')
+                       || actionGroup.querySelector('[data-testid="unretweet"]');
+        const likeBtn    = actionGroup.querySelector('[data-testid="like"]')
+                       || actionGroup.querySelector('[data-testid="unlike"]');
 
         let comments = readButtonCount(replyBtn);
         let retweets = readButtonCount(retweetBtn);
         let likes    = readButtonCount(likeBtn);
         let views    = readViewCount(art);
 
-        // Strategy: fall back to aggregated role="group" aria-label if any count is missing
-        //   "2 replies, 4 reposts, 5 likes, 83 views"
-        if (comments === 0 && retweets === 0 && likes === 0 && views === 0) {
-            const groupEl = art.querySelector('[role="group"][aria-label]');
-            const aria = groupEl ? (groupEl.getAttribute('aria-label') || '') : '';
-            if (aria) {
-                aria.split(',').forEach(part => {
-                    const p = part.trim().toLowerCase();
-                    const mm = p.match(/([\d.,]+\s*[kmb]?)\s*(.+)/i);
-                    if (!mm) return;
-                    const n = numFromStr(mm[1]);
-                    const lbl = mm[2];
-                    if      (/repl/.test(lbl)   || /رد/.test(lbl))    comments = comments || n;
-                    else if (/repost/.test(lbl) || /إعاد/.test(lbl)) retweets = retweets || n;
-                    else if (/like/.test(lbl)   || /إعجاب/.test(lbl)) likes    = likes    || n;
-                    else if (/view/.test(lbl)   || /مشاهد/.test(lbl)) views    = views    || n;
-                });
-            }
+        // Also parse the action group's combined aria-label as a SECONDARY
+        // truth source. It looks like "2 replies, 3 reposts, 8 likes, 1626 views".
+        // We take the MAX of (individual button reading, group aria value).
+        const groupEl = art.querySelector('[role="group"][aria-label]');
+        const groupAria = groupEl ? (groupEl.getAttribute('aria-label') || '') : '';
+        if (groupAria) {
+            asciiDigits(groupAria).split(/[,،]/).forEach(part => {
+                const p = part.trim().toLowerCase();
+                const mm = p.match(/([\d.,]+\s*[kmb]?)\s*(.+)/i);
+                if (!mm) return;
+                const n = numFromStr(mm[1]);
+                const lbl = mm[2];
+                if      (/repl/.test(lbl)   || /رد/.test(lbl))    comments = Math.max(comments, n);
+                else if (/repost/.test(lbl) || /إعاد/.test(lbl)) retweets = Math.max(retweets, n);
+                else if (/like/.test(lbl)   || /إعجاب/.test(lbl)) likes    = Math.max(likes, n);
+                else if (/view/.test(lbl)   || /مشاهد/.test(lbl)) views    = Math.max(views, n);
+            });
         }
 
         results.push({
@@ -1576,33 +2010,35 @@ def search_posts(query, limit=10, date_filter="all",
     posts_by_id = {}
     fetch_error = None
 
-    try:
-        for chunk_idx, (c_since, c_until, label) in enumerate(chunks):
-            # Stop early if we already have enough posts
-            if len(posts_by_id) >= limit:
-                break
-            print(f"[chunk {chunk_idx+1}/{len(chunks)}] {label} -> target {per_chunk}")
-            try:
-                chunk_raw = _selenium_search(
-                    query,
-                    limit=per_chunk,
-                    mode=mode,
-                    since_date=c_since,
-                    until_date=c_until,
-                )
-            except Exception as e:
-                print(f"[chunk {chunk_idx+1}] error: {e}")
-                fetch_error = str(e)
-                continue
+    # ─── SEQUENTIAL CHUNK EXECUTION (one shared driver) ──────────────
+    # We tried 3-way parallel drivers; X flagged the account as bot
+    # activity ("verify you are not a robot" page) within 30 seconds.
+    # Running chunks sequentially through a single warmed driver is
+    # the only reliable pattern for now.
+    for chunk_idx, (c_since, c_until, label) in enumerate(chunks):
+        if len(posts_by_id) >= limit:
+            break
+        print(f"[chunk {chunk_idx+1}/{len(chunks)}] {label} -> target {per_chunk}")
+        try:
+            chunk_raw = _selenium_search(
+                query, limit=per_chunk, mode=mode,
+                since_date=c_since, until_date=c_until,
+            )
+        except Exception as e:
+            print(f"[chunk {chunk_idx+1}] error: {e}")
+            fetch_error = str(e)
+            continue
 
-            for p in chunk_raw:
-                pid = p.get("post_url", "").split("/")[-1]
-                if pid and pid not in posts_by_id:
-                    posts_by_id[pid] = p
-    except Exception as e:
-        print(f"[search_posts] error: {e}")
-        if not posts_by_id:
-            return {"error": "تعذر إجراء البحث. تأكد من تثبيت Chrome.", "posts": []}
+        new_in_chunk = 0
+        for p in chunk_raw:
+            pid = p.get("post_url", "").split("/")[-1]
+            if pid and pid not in posts_by_id:
+                posts_by_id[pid] = p
+                new_in_chunk += 1
+        print(f"[chunk {chunk_idx+1}/{len(chunks)}] +{new_in_chunk} new (total={len(posts_by_id)})")
+
+    if not posts_by_id and fetch_error:
+        return {"error": "تعذر إجراء البحث. تأكد من تثبيت Chrome.", "posts": []}
 
     # Apply date filters (just in case X returns posts outside the range)
     range_start, range_end = get_date_range(specific_date, start_date, end_date)
@@ -1677,6 +2113,20 @@ def get_posts(username, limit=10, date_filter="all",
         clean = {k: v for k, v in p.items() if not k.startswith("_")}
         filtered.append(clean)
 
-    final = {"error": None, "posts": filtered[:limit]}
+    posts_out = filtered[:limit]
+
+    # ─── Enrich with Syndication CDN ──────────────────────────────────
+    # Fixes two things for fresh tweets:
+    #   1. Original (untranslated) caption text
+    #   2. Accurate like/reply/retweet/view counts (DOM often shows 0
+    #      for tweets posted minutes ago because counter spans haven't
+    #      rendered yet — the CDN returns the real numbers).
+    if posts_out:
+        try:
+            _enrich_with_originals(posts_out, max_workers=15)
+        except Exception as e:
+            print(f"[get_posts] enrich error: {e}")
+
+    final = {"error": None, "posts": posts_out}
     _cache_set(cache_key, final)
     return final
