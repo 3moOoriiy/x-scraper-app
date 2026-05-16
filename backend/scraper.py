@@ -1227,7 +1227,6 @@ def _selenium_search(query, limit=10, mode="keyword",
     const articles = document.querySelectorAll('article');
     const results = [];
 
-    // Extract a leading number (with optional K/M/B suffix) from a string
     function numFromStr(str) {
         if (!str) return 0;
         const m = String(str).match(/([\d.,]+\s*[KMB]?)/i);
@@ -1241,18 +1240,46 @@ def _selenium_search(query, limit=10, mode="keyword",
         return isNaN(n) ? 0 : Math.round(n * mult);
     }
 
-    function numFromAria(el) {
-        return el ? numFromStr(el.getAttribute('aria-label')) : 0;
+    // Find the VISIBLE count inside a button container by reading
+    // the `app-text-transition-container` span — that's the exact number
+    // X renders to the user.
+    function readButtonCount(btn) {
+        if (!btn) return 0;
+        // Strategy 1: the animated counter span (most accurate)
+        const anim = btn.querySelector('[data-testid="app-text-transition-container"]');
+        if (anim) {
+            const t = (anim.innerText || anim.textContent || '').trim();
+            const n = numFromStr(t);
+            if (n > 0) return n;
+        }
+        // Strategy 2: visible inner text of the button
+        const txt = (btn.innerText || btn.textContent || '').trim();
+        const fromText = numFromStr(txt);
+        if (fromText > 0) return fromText;
+        // Strategy 3: aria-label ("5 Likes. Like" → 5)
+        const aria = btn.getAttribute('aria-label') || '';
+        return numFromStr(aria);
     }
 
-    // Read count: try aria-label, fall back to inner text (the small number under the button)
-    function readCount(btn) {
-        if (!btn) return 0;
-        const fromAria = numFromAria(btn);
-        if (fromAria > 0) return fromAria;
-        // Fallback to visible text (might be empty for new tweets)
-        const txt = (btn.innerText || btn.textContent || '').trim();
-        return numFromStr(txt);
+    // Views: it's an <a href=".../analytics"> not a button
+    function readViewCount(art) {
+        // Strategy 1: animated counter inside the analytics link
+        const link = art.querySelector('a[href$="/analytics"]')
+                  || art.querySelector('a[role="link"][href*="/analytics"]');
+        if (link) {
+            const anim = link.querySelector('[data-testid="app-text-transition-container"]');
+            if (anim) {
+                const n = numFromStr(anim.innerText || anim.textContent || '');
+                if (n > 0) return n;
+            }
+            const txt = (link.innerText || link.textContent || '').trim();
+            const fromText = numFromStr(txt);
+            if (fromText > 0) return fromText;
+            const aria = link.getAttribute('aria-label') || '';
+            const fromAria = numFromStr(aria);
+            if (fromAria > 0) return fromAria;
+        }
+        return 0;
     }
 
     // Extract ORIGINAL caption text — skip any "Show translation" button or translated content
@@ -1292,22 +1319,19 @@ def _selenium_search(query, limit=10, mode="keyword",
             }
         });
 
-        // Counts - try multiple strategies
-        const replyBtn    = art.querySelector('[data-testid="reply"]');
-        const retweetBtn  = art.querySelector('[data-testid="retweet"]')
-                         || art.querySelector('[data-testid="unretweet"]');
-        const likeBtn     = art.querySelector('[data-testid="like"]')
-                         || art.querySelector('[data-testid="unlike"]');
-        const viewsLink   = art.querySelector('a[href$="/analytics"]')
-                         || art.querySelector('a[role="link"][href*="/analytics"]');
+        // Counts: read VISIBLE numbers directly from each button
+        const replyBtn   = art.querySelector('[data-testid="reply"]');
+        const retweetBtn = art.querySelector('[data-testid="retweet"]')
+                       || art.querySelector('[data-testid="unretweet"]');
+        const likeBtn    = art.querySelector('[data-testid="like"]')
+                       || art.querySelector('[data-testid="unlike"]');
 
-        // Strategy 1: per-button aria-label / inner text
-        let comments = readCount(replyBtn);
-        let retweets = readCount(retweetBtn);
-        let likes    = readCount(likeBtn);
-        let views    = readCount(viewsLink);
+        let comments = readButtonCount(replyBtn);
+        let retweets = readButtonCount(retweetBtn);
+        let likes    = readButtonCount(likeBtn);
+        let views    = readViewCount(art);
 
-        // Strategy 2: fall back to aggregated role="group" aria-label
+        // Strategy: fall back to aggregated role="group" aria-label if any count is missing
         //   "2 replies, 4 reposts, 5 likes, 83 views"
         if (comments === 0 && retweets === 0 && likes === 0 && views === 0) {
             const groupEl = art.querySelector('[role="group"][aria-label]');
